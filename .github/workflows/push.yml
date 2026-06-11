@@ -1,0 +1,18 @@
+name: Push to Replicate
+on:
+  workflow_dispatch: # Allows you to click a button to build manually
+
+jobs:
+  push_to_replicate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Cloud Cog Environment
+        uses: replicate/setup-cog@v2
+        with:
+          token: ${{ secrets.REPLICATE_CLI_AUTH_TOKEN }}
+
+      - name: Push Container to Replicate
+        run: cog push r8.im/pixelwink/winkify
