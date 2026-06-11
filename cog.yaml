@@ -1,0 +1,14 @@
+# Configuration for the serverless cloud environment
+build:
+  gpu: true
+  cuda: "12.1"
+  python_version: "3.11"
+  python_packages:
+    - "torch==2.2.1"
+    - "torchvision==0.17.1"
+    - "transformers==4.38.1"
+    - "opencv-python-headless==4.9.0.80"
+    - "pillow==10.2.0"
+    - "numpy==1.26.4"
+
+predict: "predict.py:Predictor"
