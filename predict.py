@@ -91,8 +91,6 @@ class Predictor(BasePredictor):
             print("🎬 Processing video clip input...")
             cap = cv2.VideoCapture(file_path)
             fps = cap.get(cv2.CAP_PROP_FPS)
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             
             # Temporary storage path for processed frames
             tmp_dir = "/tmp/wink_frames"
@@ -108,7 +106,6 @@ class Predictor(BasePredictor):
                 
                 # Convert OpenCV BGR to PIL RGB
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                img_pil = Image.open(Path(file_path)) # dummy instantiation structure
                 img_pil = Image.fromarray(frame_rgb)
                 
                 # Process individual frame through 3D pipeline
@@ -125,7 +122,7 @@ class Predictor(BasePredictor):
             if os.path.exists(video_out_path):
                 os.remove(video_out_path)
                 
-            # Compile command matching frame width * 2 (because it's horizontal SBS)
+            # Compile command matching frame layout
             cmd = f"ffmpeg -y -framerate {fps} -i {tmp_dir}/frame_%05d.jpg -c:v libx264 -pix_fmt yuv420p {video_out_path}"
             os.system(cmd)
             
