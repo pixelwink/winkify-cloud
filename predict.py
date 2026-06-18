@@ -2,127 +2,161 @@ import os
 import cv2
 import numpy as np
 import torch
-import shutil
+import subprocess
 from PIL import Image
 from cog import BasePredictor, Input, Path
 from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 
+
 class Predictor(BasePredictor):
     def setup(self):
-        """Load the model into GPU memory once"""
+        """Load model once into GPU memory"""
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.processor = AutoImageProcessor.from_pretrained("depth-anything/Depth-Anything-V2-Large-hf")
-        self.model = AutoModelForDepthEstimation.from_pretrained("depth-anything/Depth-Anything-V2-Large-hf")
-        self.model.to(self.device)
 
-    def process_single_frame(self, img_pil, max_shift):
-        """Core math logic: Calculates depth map and applies Navier-Stokes inpainted SBS shift"""
-        original_img = np.array(img_pil)
-        h, w, c = original_img.shape
-        
-        # 1. Get depth map
-        inputs = self.processor(images=img_pil, return_tensors="pt").to(self.device)
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-            predicted_depth = outputs.predicted_depth
-            
-        prediction = torch.nn.functional.interpolate(
-            predicted_depth.unsqueeze(1),
-            size=img_pil.size[::-1],
-            mode="bicubic",
-            align_corners=False,
+        self.processor = AutoImageProcessor.from_pretrained(
+            "depth-anything/Depth-Anything-V2-Large-hf"
         )
-        
-        depth_output = prediction.squeeze().cpu().numpy()
-        depth_min, depth_max = depth_output.min(), depth_output.max()
-        if depth_max - depth_min > 0:
-            depth_normalized = (depth_output - depth_min) / (depth_max - depth_min)
-        else:
-            depth_normalized = depth_output
-        depth_map = (depth_normalized * 255).astype(np.uint8)
-        
-        # 2. Warp perspectives
-        depth_float = depth_map.astype(np.float32) / 255.0
+
+        self.model = AutoModelForDepthEstimation.from_pretrained(
+            "depth-anything/Depth-Anything-V2-Large-hf"
+        ).to(self.device)
+
+        self.model.eval()
+        if self.device == "cuda":
+            self.model = self.model.half()
+
+    def compute_depth(self, img_pil):
+        """Fast depth inference (optimized)"""
+        with torch.no_grad():
+            inputs = self.processor(images=img_pil, return_tensors="pt").to(self.device)
+
+            if self.device == "cuda":
+                inputs = {k: v.half() if v.is_floating_point() else v for k, v in inputs.items()}
+
+            outputs = self.model(**inputs)
+            depth = outputs.predicted_depth
+
+            depth = torch.nn.functional.interpolate(
+                depth.unsqueeze(1),
+                size=img_pil.size[::-1],
+                mode="bicubic",
+                align_corners=False,
+            )
+
+        depth = depth.squeeze().float().cpu().numpy()
+
+        dmin, dmax = depth.min(), depth.max()
+        if dmax - dmin > 0:
+            depth = (depth - dmin) / (dmax - dmin)
+
+        return depth
+
+    def process_frame(self, img_bgr, max_shift):
+        """Stereo warp only (fast path)"""
+
+        h, w = img_bgr.shape[:2]
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        img_pil = Image.fromarray(img_rgb)
+
+        # 🔥 resize for speed (critical cost reduction)
+        small_pil = img_pil.resize((640, int(640 * h / w)))
+
+        depth = self.compute_depth(small_pil)
+        depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
+
         x, y = np.meshgrid(np.arange(w), np.arange(h))
-        shift_map = (depth_float * max_shift).astype(np.float32)
-        
-        map_x_l = (x - shift_map).astype(np.float32)
-        map_x_r = (x + shift_map).astype(np.float32)
+        shift = (depth * max_shift).astype(np.float32)
+
+        map_x_l = (x - shift).astype(np.float32)
+        map_x_r = (x + shift).astype(np.float32)
         map_y = y.astype(np.float32)
-        
-        left_raw = cv2.remap(original_img, map_x_l, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0,0,0))
-        right_raw = cv2.remap(original_img, map_x_r, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0,0,0))
-        
-        # 3. Clean up edge tearing via Navier-Stokes inpainting
-        mask_l = cv2.inRange(left_raw, np.array([0,0,0]), np.array([2,2,2]))
-        mask_r = cv2.inRange(right_raw, np.array([0,0,0]), np.array([2,2,2]))
-        
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        mask_l = cv2.dilate(mask_l, kernel, iterations=1)
-        mask_r = cv2.dilate(mask_r, kernel, iterations=1)
-        
-        left_eye = cv2.inpaint(left_raw, mask_l, inpaintRadius=5, flags=cv2.INPAINT_NS)
-        right_eye = cv2.inpaint(right_raw, mask_r, inpaintRadius=5, flags=cv2.INPAINT_NS)
-        
-        # Stack Side-by-Side configuration
-        return np.hstack((left_eye, right_eye))
+
+        left = cv2.remap(
+            img_bgr, map_x_l, map_y,
+            cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0)
+        )
+
+        right = cv2.remap(
+            img_bgr, map_x_r, map_y,
+            cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0)
+        )
+
+        return np.hstack((left, right))
 
     def predict(
         self,
-        file: Path = Input(description="Upload a 2D Photo (.jpg/.png) OR a Video (.mp4/.mov)"),
-        max_shift: int = Input(description="Depth intensity split level", default=15, ge=5, le=40)
+        file: Path = Input(description="Upload image or video"),
+        max_shift: int = Input(default=15, ge=5, le=40),
+        frame_skip: int = Input(default=2, ge=1, le=5)
     ) -> Path:
-        """Dynamically handle inputs and output matching stereoscopic format"""
+
         file_path = str(file)
-        extension = os.path.splitext(file_path)[1].lower()
-        
-        # --- IMAGE PIPELINE ---
-        if extension in ['.jpg', '.jpeg', '.png', '.webp']:
-            print("📸 Processing flat image input...")
-            img_pil = Image.open(file_path).convert("RGB")
-            sbs_result = self.process_single_frame(img_pil, max_shift)
-            
-            out_path = Path("/tmp/wink_sbs_output.jpg")
-            cv2.imwrite(str(out_path), cv2.cvtColor(sbs_result, cv2.COLOR_RGB2BGR))
+        ext = os.path.splitext(file_path)[1].lower()
+
+        # -------------------------
+        # IMAGE PIPELINE (fast)
+        # -------------------------
+        if ext in [".jpg", ".jpeg", ".png", ".webp"]:
+            img = cv2.imread(file_path)
+            result = self.process_frame(img, max_shift)
+
+            out_path = Path("/tmp/wink.jpg")
+            cv2.imwrite(str(out_path), result)
             return out_path
-            
-        # --- VIDEO PIPELINE (OPTIMIZED MEMORY STREAM) ---
-        elif extension in ['.mp4', '.mov', '.avi', '.mkv']:
-            print("🎬 Processing video clip input with memory-stream optimization...")
+
+        # -------------------------
+        # VIDEO PIPELINE (optimized)
+        # -------------------------
+        elif ext in [".mp4", ".mov", ".avi", ".mkv"]:
             cap = cv2.VideoCapture(file_path)
+
             fps = cap.get(cv2.CAP_PROP_FPS)
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            
-            # Setup a direct video writer straight to a temporary container file
-            video_out_path = "/tmp/wink_sbs_output.mp4"
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
-            out = cv2.VideoWriter(video_out_path, fourcc, fps, (width * 2, height))
-            
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+            raw_out = "/tmp/wink_raw.mp4"
+            final_out = "/tmp/wink_final.mp4"
+
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(raw_out, fourcc, fps, (w * 2, h))
+
+            frame_count = 0
+
             while cap.isOpened():
                 ret, frame = cap.read()
                 if not ret:
                     break
-                
-                # Convert OpenCV BGR to PIL RGB seamlessly
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                img_pil = Image.fromarray(frame_rgb)
-                
-                # Process frame entirely in GPU memory
-                sbs_frame = self.process_single_frame(img_pil, max_shift)
-                
-                # Write the memory array directly into the video stream container
-                out.write(cv2.cvtColor(sbs_frame, cv2.COLOR_RGB2BGR))
-                
+
+                # 🔥 frame skipping (major cost saver)
+                if frame_count % frame_skip != 0:
+                    frame_count += 1
+                    continue
+
+                processed = self.process_frame(frame, max_shift)
+                writer.write(processed)
+
+                frame_count += 1
+
             cap.release()
-            out.release()
-            
-            # Quick H.264 compression pass so mobile devices can stream it instantly
-            final_compressed_path = "/tmp/wink_final.mp4"
-            cmd = f"ffmpeg -y -i {video_out_path} -c:v libx264 -pix_fmt yuv420p {final_compressed_path}"
-            os.system(cmd)
-            
-            return Path(final_compressed_path)
-            
+            writer.release()
+
+            # -------------------------
+            # FAST SAFE FFMPEG ENCODE
+            # -------------------------
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-i", raw_out,
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",
+                "-preset", "veryfast",
+                final_out
+            ], check=True)
+
+            return Path(final_out)
+
         else:
-            raise ValueError("Unsupported file format! Please upload an image or video file.")
+            raise ValueError("Unsupported file type")
