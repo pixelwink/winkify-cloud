@@ -13,21 +13,21 @@ class Predictor(BasePredictor):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
         self.processor = AutoImageProcessor.from_pretrained(
-            "DepthAnything/Depth-Anything-V2-Large-hf"
+            "depth-anything/Depth-Anything-V2-Large-hf"
         )
 
         self.model = AutoModelForDepthEstimation.from_pretrained(
-            "DepthAnything/Depth-Anything-V2-Large-hf"
+            "depth-anything/Depth-Anything-V2-Large-hf"
         ).to(self.device)
 
         self.model.eval()
 
-        # Speed boost
+        # speed boost
         if self.device == "cuda":
             self.model = self.model.half()
 
     # -----------------------------
-    # DEPTH MODEL
+    # DEPTH MODEL (FAST + CACHED USAGE)
     # -----------------------------
     def compute_depth(self, img_pil):
         with torch.no_grad():
@@ -109,253 +109,195 @@ class Predictor(BasePredictor):
         )
 
     # -----------------------------
-    # IMAGE PIPELINE
-    # -----------------------------
-    def process_image(self, file_path, max_shift):
-        img = cv2.imread(file_path)
-
-        if img is None:
-            raise ValueError("Could not decode input as an image.")
-
-        img_rgb = cv2.cvtColor(
-            img,
-            cv2.COLOR_BGR2RGB
-        )
-
-        pil = Image.fromarray(img_rgb)
-
-        # High-quality full-resolution depth
-        depth = self.compute_depth(pil)
-
-        depth = cv2.resize(
-            depth,
-            (img.shape[1], img.shape[0])
-        )
-
-        result = self.process_frame(
-            img,
-            depth,
-            max_shift
-        )
-
-        out = Path("/tmp/wink.jpg")
-
-        cv2.imwrite(
-            str(out),
-            result,
-            [cv2.IMWRITE_JPEG_QUALITY, 95]
-        )
-
-        return out
-
-    # -----------------------------
-    # VIDEO PIPELINE
-    # -----------------------------
-    def process_video(
-        self,
-        file_path,
-        max_shift,
-        keyframe_interval
-    ):
-        cap = cv2.VideoCapture(file_path)
-
-        if not cap.isOpened():
-            raise ValueError(
-                "Could not decode input as a video."
-            )
-
-        fps = cap.get(cv2.CAP_PROP_FPS)
-
-        if fps <= 0:
-            fps = 30.0
-
-        w = int(
-            cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-        )
-
-        h = int(
-            cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-        )
-
-        if w <= 0 or h <= 0:
-            cap.release()
-
-            raise ValueError(
-                "Could not determine video dimensions."
-            )
-
-        raw_out = "/tmp/wink_raw.mp4"
-        final_out = "/tmp/wink_final.mp4"
-
-        writer = cv2.VideoWriter(
-            raw_out,
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            fps,
-            (w * 2, h)
-        )
-
-        if not writer.isOpened():
-            cap.release()
-
-            raise ValueError(
-                "Could not create output video."
-            )
-
-        frame_idx = 0
-        depth_cache = None
-
-        while True:
-            ret, frame = cap.read()
-
-            if not ret:
-                break
-
-            # -------------------------
-            # KEYFRAME DEPTH
-            # -------------------------
-            if (
-                depth_cache is None
-                or frame_idx % keyframe_interval == 0
-            ):
-                small_height = max(
-                    1,
-                    int(640 * h / w)
-                )
-
-                small = cv2.resize(
-                    frame,
-                    (640, small_height)
-                )
-
-                rgb = cv2.cvtColor(
-                    small,
-                    cv2.COLOR_BGR2RGB
-                )
-
-                pil = Image.fromarray(rgb)
-
-                depth_cache = self.compute_depth(
-                    pil
-                )
-
-                depth_cache = cv2.resize(
-                    depth_cache,
-                    (w, h)
-                )
-
-            depth = depth_cache
-
-            # Light smoothing for temporal stability
-            depth = cv2.GaussianBlur(
-                depth,
-                (5, 5),
-                0
-            )
-
-            result = self.process_frame(
-                frame,
-                depth,
-                max_shift
-            )
-
-            writer.write(result)
-
-            frame_idx += 1
-
-        cap.release()
-        writer.release()
-
-        if frame_idx == 0:
-            raise ValueError(
-                "Video contained no readable frames."
-            )
-
-        # -----------------------------
-        # FINAL H.264 ENCODING
-        # -----------------------------
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-i",
-                raw_out,
-                "-c:v",
-                "libx264",
-                "-pix_fmt",
-                "yuv420p",
-                "-preset",
-                "veryfast",
-                final_out
-            ],
-            check=True
-        )
-
-        return Path(final_out)
-
-    # -----------------------------
     # MAIN PIPELINE
     # -----------------------------
     def predict(
         self,
-        file: Path = Input(
-            description="Image or video"
-        ),
-        max_shift: int = Input(
-            default=15,
-            ge=5,
-            le=40
-        ),
-        keyframe_interval: int = Input(
-            default=12,
-            ge=2,
-            le=30
-        ),
-        video_inpaint: bool = Input(
-            default=False
-        )
+        file: Path = Input(description="Image or video"),
+        max_shift: int = Input(default=15, ge=5, le=40),
+        keyframe_interval: int = Input(default=12, ge=2, le=30),
+        video_inpaint: bool = Input(default=False)
     ) -> Path:
 
         file_path = str(file)
 
-        # -----------------------------
-        # TRY IMAGE FIRST
-        # -----------------------------
+        # ------------------------------------------------
+        # DETERMINE FILE TYPE
+        # ------------------------------------------------
+        # Replicate/Cog may give the mounted file a temporary
+        # filename without the original extension.
+        #
+        # Try PIL first. If PIL can decode it, it's an image.
+        # Otherwise fall back to the original file extension
+        # for video handling.
+        # ------------------------------------------------
+
         try:
+            with Image.open(file_path) as test_image:
+                ext = ".image"
+        except Exception:
+            ext = os.path.splitext(file_path)[1].lower()
+
+        # -------------------------
+        # IMAGE MODE (FULL QUALITY)
+        # -------------------------
+        if ext in [".jpg", ".jpeg", ".png", ".webp", ".image"]:
+
             img = cv2.imread(file_path)
 
-            if img is not None:
-                return self.process_image(
-                    file_path,
+            if img is None:
+                raise ValueError(
+                    "Could not decode image file."
+                )
+
+            img_rgb = cv2.cvtColor(
+                img,
+                cv2.COLOR_BGR2RGB
+            )
+
+            pil = Image.fromarray(img_rgb)
+
+            # high quality full-res depth
+            depth = self.compute_depth(pil)
+
+            depth = cv2.resize(
+                depth,
+                (img.shape[1], img.shape[0])
+            )
+
+            result = self.process_frame(
+                img,
+                depth,
+                max_shift
+            )
+
+            out = Path("/tmp/wink.jpg")
+
+            cv2.imwrite(
+                str(out),
+                result
+            )
+
+            return out
+
+        # -------------------------
+        # VIDEO MODE (KEYFRAME DEPTH)
+        # -------------------------
+        elif ext in [".mp4", ".mov", ".avi", ".mkv"]:
+
+            cap = cv2.VideoCapture(file_path)
+
+            if not cap.isOpened():
+                raise ValueError(
+                    "Could not open video file."
+                )
+
+            fps = cap.get(cv2.CAP_PROP_FPS)
+
+            w = int(
+                cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+            )
+
+            h = int(
+                cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+            )
+
+            raw_out = "/tmp/wink_raw.mp4"
+            final_out = "/tmp/wink_final.mp4"
+
+            writer = cv2.VideoWriter(
+                raw_out,
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                fps,
+                (w * 2, h)
+            )
+
+            frame_idx = 0
+            depth_cache = None
+
+            while True:
+
+                ret, frame = cap.read()
+
+                if not ret:
+                    break
+
+                # -------------------------
+                # KEYFRAME DEPTH LOGIC
+                # -------------------------
+                if frame_idx % keyframe_interval == 0:
+
+                    small = cv2.resize(
+                        frame,
+                        (
+                            640,
+                            int(640 * h / w)
+                        )
+                    )
+
+                    rgb = cv2.cvtColor(
+                        small,
+                        cv2.COLOR_BGR2RGB
+                    )
+
+                    pil = Image.fromarray(rgb)
+
+                    depth_cache = self.compute_depth(
+                        pil
+                    )
+
+                    depth_cache = cv2.resize(
+                        depth_cache,
+                        (w, h)
+                    )
+
+                # reuse cached depth
+                depth = depth_cache
+
+                # optional: light smoothing for stability
+                depth = cv2.GaussianBlur(
+                    depth,
+                    (5, 5),
+                    0
+                )
+
+                result = self.process_frame(
+                    frame,
+                    depth,
                     max_shift
                 )
 
-        except Exception:
-            pass
+                # video mode: skip expensive inpaint by default
+                writer.write(result)
 
-        # -----------------------------
-        # IF NOT IMAGE, TRY VIDEO
-        # -----------------------------
-        try:
-            cap = cv2.VideoCapture(file_path)
-
-            if cap.isOpened():
-                cap.release()
-
-                return self.process_video(
-                    file_path,
-                    max_shift,
-                    keyframe_interval
-                )
+                frame_idx += 1
 
             cap.release()
+            writer.release()
 
-        except Exception:
-            pass
+            # -------------------------
+            # SAFE ENCODING
+            # -------------------------
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    raw_out,
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-preset",
+                    "veryfast",
+                    final_out
+                ],
+                check=True
+            )
 
-        # -----------------------------
-        # NOTHING WORKED
-        # -----------------------------
-        raise ValueError(
-            "Unsupported file format. "
-            "Could not decode input as an image or video."
-        )
+            return Path(final_out)
+
+        else:
+            raise ValueError(
+                f"Unsupported file format: {ext}"
+            )
